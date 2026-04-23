@@ -33,13 +33,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, display_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -2687,7 +2687,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 
 def _read_acp_provider_registry() -> Dict[str, Dict[str, Any]]:
-    """Load ACP providers from $HERMES_HOME/acp.json."""
+    """Load ACP providers from the profile-scoped ACP registry file."""
     path = get_hermes_home() / "acp.json"
     if not path.exists():
         return {}
@@ -2711,11 +2711,47 @@ def _read_acp_provider_registry() -> Dict[str, Dict[str, Any]]:
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
-            name = str(entry.get("name") or entry.get("id") or "").strip()
+            name_raw = entry.get("name")
+            if name_raw is None:
+                name_raw = entry.get("id")
+            name = str(name_raw or "").strip()
             if not name:
                 continue
             providers[name] = dict(entry)
     return providers
+
+
+def _read_acp_default_provider_name() -> str:
+    """Read default provider name from $HERMES_HOME/acp.json."""
+    path = get_hermes_home() / "acp.json"
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        raise AuthError(
+            f"Failed to parse ACP config at {path}: {exc}",
+            provider="generic-acp",
+            code="invalid_acp_config",
+        ) from exc
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("default_provider") or payload.get("default") or "").strip()
+
+
+def _default_acp_args() -> list[str]:
+    return ["--acp", "--stdio"]
+
+
+def _normalize_acp_args(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return _default_acp_args()
+        return shlex.split(text)
+    return _default_acp_args()
 
 
 def _parse_acp_provider_name_hint(requested_provider: str = "") -> str:
@@ -2727,7 +2763,8 @@ def _parse_acp_provider_name_hint(requested_provider: str = "") -> str:
     return ""
 
 
-def _resolve_generic_acp_provider(requested_provider: str = "") -> tuple[str, Dict[str, Any]]:
+def _resolve_generic_acp_provider(requested_provider: str = "") -> Tuple[str, Dict[str, Any]]:
+    """Resolve generic ACP provider from acp.json (or HERMES_ACP_* fallback)."""
     providers = _read_acp_provider_registry()
     requested_name = _parse_acp_provider_name_hint(requested_provider)
     env_name = os.getenv("HERMES_ACP_PROVIDER", "").strip()
@@ -2746,12 +2783,7 @@ def _resolve_generic_acp_provider(requested_provider: str = "") -> tuple[str, Di
         )
 
     if providers:
-        default_name = ""
-        try:
-            payload = json.loads((get_hermes_home() / "acp.json").read_text())
-            default_name = str(payload.get("default_provider") or payload.get("default") or "").strip()
-        except Exception:
-            default_name = ""
+        default_name = _read_acp_default_provider_name()
         if default_name and default_name in providers:
             entry = dict(providers[default_name])
             entry.setdefault("name", default_name)
@@ -2762,15 +2794,9 @@ def _resolve_generic_acp_provider(requested_provider: str = "") -> tuple[str, Di
         return first_name, entry
 
     command = os.getenv("HERMES_ACP_COMMAND", "").strip()
-    raw_args = os.getenv("HERMES_ACP_ARGS", "").strip()
+    raw_args = os.getenv("HERMES_ACP_ARGS", "")
     base_url = os.getenv("HERMES_ACP_BASE_URL", "").strip() or DEFAULT_GENERIC_ACP_BASE_URL
-    if raw_args:
-        try:
-            args = shlex.split(raw_args)
-        except Exception:
-            args = ["--acp", "--stdio"]
-    else:
-        args = ["--acp", "--stdio"]
+    args = _normalize_acp_args(raw_args)
     return "default", {"command": command, "args": args, "base_url": base_url}
 
 
@@ -2798,7 +2824,7 @@ def resolve_external_process_provider_credentials(
             or "copilot"
         )
         raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        args = _normalize_acp_args(raw_args)
         provider_name = ""
         api_key = "copilot-acp"
     else:
@@ -2811,13 +2837,9 @@ def resolve_external_process_provider_credentials(
 
         command = str(selected.get("command") or "").strip() or os.getenv("HERMES_ACP_COMMAND", "").strip()
         raw_args = selected.get("args")
-        if isinstance(raw_args, list):
-            args = [str(item) for item in raw_args]
-        elif isinstance(raw_args, str):
-            args = shlex.split(raw_args) if raw_args.strip() else ["--acp", "--stdio"]
-        else:
-            raw_arg_text = str(selected.get("args_text") or os.getenv("HERMES_ACP_ARGS", "")).strip()
-            args = shlex.split(raw_arg_text) if raw_arg_text else ["--acp", "--stdio"]
+        if raw_args is None:
+            raw_args = selected.get("args_text") or os.getenv("HERMES_ACP_ARGS", "")
+        args = _normalize_acp_args(raw_args)
         api_key = f"generic-acp:{provider_name or 'default'}"
 
     resolved_command = shutil.which(command) if command else None
@@ -2831,7 +2853,7 @@ def resolve_external_process_provider_credentials(
             )
         raise AuthError(
             f"Could not find ACP command '{command}'. "
-            "Configure $HERMES_HOME/acp.json or set HERMES_ACP_COMMAND.",
+            f"Configure {display_hermes_home()}/acp.json or set HERMES_ACP_COMMAND.",
             provider=provider_id,
             code="missing_acp_command",
         )
