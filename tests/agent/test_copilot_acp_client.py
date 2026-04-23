@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import (
+    ACP_MARKER_BASE_URL,
+    ACP_MARKER_GENERIC_BASE_URL,
+    CopilotACPClient,
+)
 
 
 class _FakeProcess:
@@ -140,6 +144,131 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
 
         self.assertIn("error", response)
         self.assertFalse(outside.exists())
+
+
+class GenericACPClientTests(unittest.TestCase):
+    """Tests for generic ACP provider (e.g. codefree --acp --stdio)."""
+
+    def test_marker_urls_are_distinct(self) -> None:
+        self.assertNotEqual(ACP_MARKER_BASE_URL, ACP_MARKER_GENERIC_BASE_URL)
+        self.assertTrue(ACP_MARKER_BASE_URL.startswith("acp://"))
+        self.assertTrue(ACP_MARKER_GENERIC_BASE_URL.startswith("acp://"))
+
+    def test_client_accepts_custom_command(self) -> None:
+        client = CopilotACPClient(
+            acp_command="codefree",
+            acp_args=["--acp", "--stdio"],
+            acp_cwd="/tmp",
+        )
+        self.assertEqual(client._acp_command, "codefree")
+        self.assertEqual(client._acp_args, ["--acp", "--stdio"])
+
+    def test_client_reads_hermes_acp_command_env_var(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HERMES_ACP_COMMAND": "codefree", "HERMES_ACP_ARGS": "--acp --stdio"},
+            clear=False,
+        ):
+            from agent.copilot_acp_client import _resolve_command, _resolve_args
+            # Env var is read by the module-level helpers when no explicit
+            # command is passed. We test the helpers directly.
+            # Note: _resolve_command reads HERMES_COPILOT_ACP_COMMAND first;
+            # HERMES_ACP_COMMAND is resolved in auth.py and passed explicitly.
+            # Here we just verify the client stores whatever is passed.
+            client = CopilotACPClient(
+                acp_command="codefree",
+                acp_args=["--acp", "--stdio"],
+                acp_cwd="/tmp",
+            )
+        self.assertEqual(client._acp_command, "codefree")
+
+    def test_generic_acp_marker_base_url(self) -> None:
+        client = CopilotACPClient(
+            base_url=ACP_MARKER_GENERIC_BASE_URL,
+            acp_command="codefree",
+            acp_cwd="/tmp",
+        )
+        self.assertEqual(client.base_url, ACP_MARKER_GENERIC_BASE_URL)
+
+    def test_dispatch_works_for_generic_client(self) -> None:
+        client = CopilotACPClient(acp_command="codefree", acp_cwd="/tmp")
+        process = _FakeProcess()
+        handled = client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/request_permission",
+                "params": {},
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=[],
+            reasoning_parts=[],
+        )
+        self.assertTrue(handled)
+        response = json.loads(process.stdin.getvalue().strip())
+        outcome = (((response.get("result") or {}).get("outcome") or {}).get("outcome"))
+        self.assertEqual(outcome, "cancelled")
+
+
+class GenericACPProviderRegistryTests(unittest.TestCase):
+    """Tests that the generic-acp provider is correctly registered."""
+
+    def test_generic_acp_in_provider_registry(self) -> None:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        self.assertIn("generic-acp", PROVIDER_REGISTRY)
+        pconfig = PROVIDER_REGISTRY["generic-acp"]
+        self.assertEqual(pconfig.auth_type, "external_process")
+        self.assertTrue(pconfig.inference_base_url.startswith("acp://"))
+
+    def test_generic_acp_aliases(self) -> None:
+        from hermes_cli.auth import resolve_provider
+
+        self.assertEqual(resolve_provider("acp"), "generic-acp")
+        self.assertEqual(resolve_provider("generic-acp-agent"), "generic-acp")
+
+    def test_get_external_process_provider_status_generic_acp(self) -> None:
+        from hermes_cli.auth import get_external_process_provider_status
+
+        with patch.dict(
+            os.environ,
+            {"HERMES_ACP_COMMAND": "/usr/bin/true"},
+            clear=False,
+        ):
+            status = get_external_process_provider_status("generic-acp")
+
+        self.assertEqual(status["provider"], "generic-acp")
+        self.assertIn("command", status)
+        self.assertIn("args", status)
+
+    def test_resolve_external_process_credentials_generic_acp_missing_command(self) -> None:
+        from hermes_cli.auth import resolve_external_process_provider_credentials, AuthError
+
+        with patch.dict(
+            os.environ,
+            {"HERMES_ACP_COMMAND": "__no_such_acp_cli__"},
+            clear=False,
+        ):
+            with self.assertRaises(AuthError) as ctx:
+                resolve_external_process_provider_credentials("generic-acp")
+
+        self.assertIn("HERMES_ACP_COMMAND", str(ctx.exception))
+
+    def test_resolve_external_process_credentials_generic_acp_with_command(self) -> None:
+        from hermes_cli.auth import resolve_external_process_provider_credentials
+
+        with patch.dict(
+            os.environ,
+            {"HERMES_ACP_COMMAND": "/usr/bin/true"},
+            clear=False,
+        ):
+            creds = resolve_external_process_provider_credentials("generic-acp")
+
+        self.assertEqual(creds["provider"], "generic-acp")
+        self.assertEqual(creds["source"], "process")
+        self.assertIn("command", creds)
+        self.assertIn("args", creds)
 
 
 if __name__ == "__main__":

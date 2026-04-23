@@ -1304,6 +1304,22 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "HERMES_ACP_COMMAND": {
+        "description": "Command for the generic ACP agent CLI (e.g. 'codefree')",
+        "prompt": "Generic ACP CLI command (e.g. codefree)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "HERMES_ACP_ARGS": {
+        "description": "Args for the generic ACP agent CLI (default: --acp --stdio)",
+        "prompt": "Generic ACP CLI args (leave empty for default: --acp --stdio)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
 
     # ── Tool API keys ──
     "EXA_API_KEY": {

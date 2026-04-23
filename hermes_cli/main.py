@@ -1560,6 +1560,8 @@ def select_provider_and_model(args=None):
         _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
+    elif selected_provider == "generic-acp":
+        _model_flow_generic_acp(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
@@ -3369,7 +3371,65 @@ def _model_flow_copilot_acp(config, current_model=""):
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
-def _model_flow_kimi(config, current_model=""):
+def _model_flow_generic_acp(config, current_model=""):
+    """Generic ACP agent flow using any ACP-compatible CLI (e.g. codefree --acp)."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        DEFAULT_GENERIC_ACP_BASE_URL,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config
+
+    provider_id = "generic-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or ""
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Generic ACP delegates Hermes turns to any ACP-compatible CLI subprocess.")
+    print("  Hermes starts a short-lived ACP subprocess for each request.")
+    print(f"  Set HERMES_ACP_COMMAND to your ACP CLI (e.g. 'codefree').")
+    print(f"  Set HERMES_ACP_ARGS to the ACP stdio args (default: --acp --stdio).")
+    if resolved_command:
+        print(f"  Resolved command: {resolved_command}")
+    else:
+        print("  ⚠ No ACP command resolved. Set HERMES_ACP_COMMAND before running.")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        model_name = input("Model name hint (leave empty to skip): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return
+
+    if not model_name:
+        print("No change.")
+        return
+
+    _save_model_choice(model_name)
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {model_name} (via Generic ACP Agent)")
+
+
+
     """Kimi / Moonshot model selection with automatic endpoint routing.
 
     - sk-kimi-* keys   → api.kimi.com/coding/v1  (Kimi Coding Plan)
@@ -6685,6 +6745,7 @@ For more help on a command:
             "nous",
             "openai-codex",
             "copilot-acp",
+            "generic-acp",
             "copilot",
             "anthropic",
             "gemini",
