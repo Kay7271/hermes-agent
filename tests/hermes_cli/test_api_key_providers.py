@@ -31,6 +31,7 @@ class TestProviderRegistry:
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("generic-acp", "Generic ACP", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
@@ -114,6 +115,7 @@ class TestProviderRegistry:
     def test_base_urls(self):
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
+        assert PROVIDER_REGISTRY["generic-acp"].inference_base_url == "acp://generic"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
         assert PROVIDER_REGISTRY["stepfun"].inference_base_url == STEPFUN_STEP_PLAN_INTL_BASE_URL
@@ -147,6 +149,7 @@ PROVIDER_ENV_VARS = (
     "NOUS_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_BASE_URL", "HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH",
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_ACP_BASE_URL",
+    "HERMES_ACP_PROVIDER", "HERMES_ACP_COMMAND", "HERMES_ACP_ARGS", "HERMES_ACP_BASE_URL",
 )
 
 
@@ -231,6 +234,13 @@ class TestResolveProvider:
     def test_alias_github_copilot_acp(self):
         assert resolve_provider("github-copilot-acp") == "copilot-acp"
         assert resolve_provider("copilot-acp-agent") == "copilot-acp"
+
+    def test_alias_generic_acp(self):
+        assert resolve_provider("acp") == "generic-acp"
+
+    def test_prefixed_generic_acp_provider(self):
+        assert resolve_provider("acp:codefree") == "generic-acp"
+        assert resolve_provider("generic-acp:codefree") == "generic-acp"
 
     def test_explicit_huggingface(self):
         assert resolve_provider("huggingface") == "huggingface"
@@ -374,6 +384,38 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
+    def test_get_auth_status_dispatches_to_generic_external_process(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "acp.json").write_text(
+            '{"providers":{"codefree":{"command":"codefree","args":["--acp","--stdio"],"base_url":"acp://codefree"}}}'
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/opt/bin/{command}")
+
+        status = get_auth_status("generic-acp")
+
+        assert status["configured"] is True
+        assert status["provider"] == "generic-acp"
+
+    def test_generic_acp_status_from_acp_json(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "acp.json").write_text(
+            '{"default_provider":"codefree","providers":{"codefree":{"command":"codefree","args":["serve","--acp"],"base_url":"acp://codefree"}}}'
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        status = get_external_process_provider_status("generic-acp")
+
+        assert status["configured"] is True
+        assert status["provider"] == "generic-acp"
+        assert status["provider_name"] == "codefree"
+        assert status["command"] == "codefree"
+        assert status["args"] == ["serve", "--acp"]
+        assert status["base_url"] == "acp://codefree"
+
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
@@ -446,6 +488,25 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["api_key"] == "copilot-acp"
         assert creds["base_url"] == "acp://copilot"
         assert creds["command"] == "/usr/local/bin/copilot"
+        assert creds["args"] == ["--acp", "--stdio"]
+        assert creds["source"] == "process"
+
+    def test_resolve_generic_acp_from_acp_json(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "acp.json").write_text(
+            '{"default_provider":"codefree","providers":{"codefree":{"command":"codefree","args":["--acp","--stdio"],"base_url":"acp://codefree"}}}'
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        creds = resolve_external_process_provider_credentials("generic-acp", requested_provider="acp:codefree")
+
+        assert creds["provider"] == "generic-acp"
+        assert creds["provider_name"] == "codefree"
+        assert creds["api_key"] == "generic-acp:codefree"
+        assert creds["base_url"] == "acp://codefree"
+        assert creds["command"] == "/usr/local/bin/codefree"
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
 
@@ -647,6 +708,26 @@ class TestRuntimeProviderResolution:
         assert result["base_url"] == "acp://copilot"
         assert result["command"] == "/usr/local/bin/copilot"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
+
+    def test_runtime_generic_acp_uses_acp_json_provider(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "acp.json").write_text(
+            '{"default_provider":"codefree","providers":{"codefree":{"command":"codefree","args":["--acp","--stdio"],"base_url":"acp://codefree"}}}'
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="acp:codefree")
+
+        assert result["provider"] == "generic-acp"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "generic-acp:codefree"
+        assert result["base_url"] == "acp://codefree"
+        assert result["command"] == "/usr/local/bin/codefree"
+        assert result["args"] == ["--acp", "--stdio"]
 
 
 # =============================================================================

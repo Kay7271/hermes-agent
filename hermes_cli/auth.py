@@ -71,6 +71,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_GENERIC_ACP_BASE_URL = "acp://generic"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -149,6 +150,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "generic-acp": ProviderConfig(
+        id="generic-acp",
+        name="Generic ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_GENERIC_ACP_BASE_URL,
+        base_url_env_var="HERMES_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1010,6 +1018,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "acp": "generic-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
@@ -1030,6 +1039,8 @@ def resolve_provider(
         return "openrouter"
     if normalized == "custom":
         return "custom"
+    if normalized.startswith("acp:") or normalized.startswith("generic-acp:"):
+        return "generic-acp"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -2579,22 +2590,29 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
+    if provider_id == "copilot-acp":
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+        if not base_url:
+            base_url = pconfig.inference_base_url
+    else:
+        selected_name, selected = _resolve_generic_acp_provider()
+        command = str(selected.get("command", "") or "").strip()
+        args = list(selected.get("args") or [])
+        base_url = str(selected.get("base_url", "") or "").strip() or pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
         "name": pconfig.name,
+        "provider_name": selected_name if provider_id != "copilot-acp" else "",
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
@@ -2614,10 +2632,10 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "google-gemini-cli":
         return get_gemini_oauth_auth_status()
-    if target == "copilot-acp":
-        return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
+    if pconfig and pconfig.auth_type == "external_process":
+        return get_external_process_provider_status(target)
     if pconfig and pconfig.auth_type == "api_key":
         return get_api_key_provider_status(target)
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
@@ -2668,7 +2686,99 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
-def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
+def _read_acp_provider_registry() -> Dict[str, Dict[str, Any]]:
+    """Load ACP providers from $HERMES_HOME/acp.json."""
+    path = get_hermes_home() / "acp.json"
+    if not path.exists():
+        return {}
+
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        raise AuthError(
+            f"Failed to parse ACP config at {path}: {exc}",
+            provider="generic-acp",
+            code="invalid_acp_config",
+        ) from exc
+
+    providers: Dict[str, Dict[str, Any]] = {}
+    raw = payload.get("providers") if isinstance(payload, dict) else None
+    if isinstance(raw, dict):
+        for name, entry in raw.items():
+            if isinstance(entry, dict) and str(name or "").strip():
+                providers[str(name).strip()] = dict(entry)
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("id") or "").strip()
+            if not name:
+                continue
+            providers[name] = dict(entry)
+    return providers
+
+
+def _parse_acp_provider_name_hint(requested_provider: str = "") -> str:
+    normalized = str(requested_provider or "").strip().lower()
+    if normalized.startswith("acp:"):
+        return normalized.split(":", 1)[1].strip()
+    if normalized.startswith("generic-acp:"):
+        return normalized.split(":", 1)[1].strip()
+    return ""
+
+
+def _resolve_generic_acp_provider(requested_provider: str = "") -> tuple[str, Dict[str, Any]]:
+    providers = _read_acp_provider_registry()
+    requested_name = _parse_acp_provider_name_hint(requested_provider)
+    env_name = os.getenv("HERMES_ACP_PROVIDER", "").strip()
+
+    selected_name = requested_name or env_name
+    if selected_name and selected_name in providers:
+        entry = dict(providers[selected_name])
+        entry.setdefault("name", selected_name)
+        return selected_name, entry
+
+    if selected_name and selected_name not in providers:
+        raise AuthError(
+            f"ACP provider '{selected_name}' not found in {get_hermes_home() / 'acp.json'}.",
+            provider="generic-acp",
+            code="unknown_acp_provider",
+        )
+
+    if providers:
+        default_name = ""
+        try:
+            payload = json.loads((get_hermes_home() / "acp.json").read_text())
+            default_name = str(payload.get("default_provider") or payload.get("default") or "").strip()
+        except Exception:
+            default_name = ""
+        if default_name and default_name in providers:
+            entry = dict(providers[default_name])
+            entry.setdefault("name", default_name)
+            return default_name, entry
+        first_name = next(iter(providers))
+        entry = dict(providers[first_name])
+        entry.setdefault("name", first_name)
+        return first_name, entry
+
+    command = os.getenv("HERMES_ACP_COMMAND", "").strip()
+    raw_args = os.getenv("HERMES_ACP_ARGS", "").strip()
+    base_url = os.getenv("HERMES_ACP_BASE_URL", "").strip() or DEFAULT_GENERIC_ACP_BASE_URL
+    if raw_args:
+        try:
+            args = shlex.split(raw_args)
+        except Exception:
+            args = ["--acp", "--stdio"]
+    else:
+        args = ["--acp", "--stdio"]
+    return "default", {"command": command, "args": args, "base_url": base_url}
+
+
+def resolve_external_process_provider_credentials(
+    provider_id: str,
+    *,
+    requested_provider: str = "",
+) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
@@ -2678,29 +2788,58 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
+    if provider_id == "copilot-acp":
+        base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+        if not base_url:
+            base_url = pconfig.inference_base_url
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        provider_name = ""
+        api_key = "copilot-acp"
+    else:
+        provider_name, selected = _resolve_generic_acp_provider(requested_provider)
+        base_url = str(selected.get("base_url") or "").strip()
+        if not base_url:
+            base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+        if not base_url:
+            base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        command = str(selected.get("command") or "").strip() or os.getenv("HERMES_ACP_COMMAND", "").strip()
+        raw_args = selected.get("args")
+        if isinstance(raw_args, list):
+            args = [str(item) for item in raw_args]
+        elif isinstance(raw_args, str):
+            args = shlex.split(raw_args) if raw_args.strip() else ["--acp", "--stdio"]
+        else:
+            raw_arg_text = str(selected.get("args_text") or os.getenv("HERMES_ACP_ARGS", "")).strip()
+            args = shlex.split(raw_arg_text) if raw_arg_text else ["--acp", "--stdio"]
+        api_key = f"generic-acp:{provider_name or 'default'}"
+
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        if provider_id == "copilot-acp":
+            raise AuthError(
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+                provider=provider_id,
+                code="missing_copilot_cli",
+            )
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find ACP command '{command}'. "
+            "Configure $HERMES_HOME/acp.json or set HERMES_ACP_COMMAND.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_acp_command",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "provider_name": provider_name,
+        "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

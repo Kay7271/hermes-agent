@@ -856,7 +856,7 @@ def resolve_runtime_provider(
                         "falling through to next provider.")
 
     if provider == "copilot-acp":
-        creds = resolve_external_process_provider_credentials(provider)
+        creds = resolve_external_process_provider_credentials(provider, requested_provider=requested_provider)
         return {
             "provider": "copilot-acp",
             "api_mode": "chat_completions",
@@ -864,6 +864,20 @@ def resolve_runtime_provider(
             "api_key": creds.get("api_key", ""),
             "command": creds.get("command", ""),
             "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
+    if provider == "generic-acp":
+        creds = resolve_external_process_provider_credentials(provider, requested_provider=requested_provider)
+        return {
+            "provider": "generic-acp",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "provider_name": creds.get("provider_name", ""),
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
         }
